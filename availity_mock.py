@@ -9,7 +9,12 @@ limits, cost, flakiness, and it would measure *their* throughput, not ours). Thi
 mock stands in for Availity so the run exercises OUR system — the fan-out deferred
 pipeline, mapping, completion, webhooks — at full speed.
 
-It implements exactly the three calls the engine makes (see availity_api.clj):
+It mocks BOTH eligibility engines so a load run can exercise whichever channel
+production routes a payer to (SOAP is preferred when available, see
+ADR-0008 — soap-engine-enabled? is true in prod, so RealTime-capable payers
+route to availity-soap, NOT availity-api).
+
+REST engine (`billing.eligibility.engines.availity-api`) — three calls:
 
   POST {base}/token
       form: grant_type, client_id, client_secret, scope=hipaa
@@ -23,6 +28,18 @@ It implements exactly the three calls the engine makes (see availity_api.clj):
       -> 200 <full coverage body>            (mapping -> CoverageEligibilityResponse)
       or 200 {"status": "In Progress"}       (engine treats as pending -> poll path)
       or 4xx / {"errors": [...]}              (engine treats as failure)
+
+SOAP engine (`billing.eligibility.engines.availity-soap`) — one call:
+
+  POST {base}                        (Content-Type: text/xml, CAQH CORE envelope)
+      body: SOAP <Payload><![CDATA[ X12 270 (1..N transaction sets) ]]></Payload>
+      -> 200 SOAP <Payload><![CDATA[ X12 271 (one ST/SE per inbound 270 set) ]]>
+      Each 271 echoes the inbound 270 transaction set's BHT03 into its own BHT03 —
+      this is how the engine matches a 271 back to its request
+      (x12-271/parse-response-x12 keys st->request-id on BHT03). Get this wrong and
+      every response fails with "No response matched this request via TRN".
+      The 271 body drives the full X12 271 -> FHIR mapping (the heavy CPU path the
+      perf run targets). ERROR_PCT swaps in an AAA*N* rejection per set.
 
 Pointing the service at this mock is a config change on the payer's ExchangeProfile
 (`credentials.base-url`), NOT something the load client sends per request — the mock
@@ -61,6 +78,7 @@ Tunables (env):
 import json
 import os
 import random
+import re
 import threading
 import time
 from collections import Counter
@@ -77,6 +95,10 @@ _TEMPLATE_PATH = os.getenv("AVAILITY_MOCK_TEMPLATE", "").strip()
 _CLIENT_ID = os.getenv("AVAILITY_MOCK_CLIENT_ID", "").strip()
 _CLIENT_SECRET = os.getenv("AVAILITY_MOCK_CLIENT_SECRET", "").strip()
 _TRACK_MEMBERS = os.getenv("AVAILITY_MOCK_TRACK_MEMBERS", "0") == "1"
+# SOAP engine: optional WSSE check. If set, the CORE envelope's UsernameToken must
+# match or the mock returns a SOAP fault (-> engine fails the whole batch).
+_SOAP_USERNAME = os.getenv("AVAILITY_MOCK_SOAP_USERNAME", "").strip()
+_SOAP_PASSWORD = os.getenv("AVAILITY_MOCK_SOAP_PASSWORD", "").strip()
 
 # --------------------------------------------------------------------------- #
 # Coverage body template.
@@ -293,6 +315,237 @@ def _coverage_body(member_id: str | None) -> dict:
     return body
 
 
+# --------------------------------------------------------------------------- #
+# SOAP / X12 270 -> 271  (availity-soap engine).
+#
+# The SOAP engine posts ONE CAQH CORE envelope carrying an X12 270 (1..N
+# transaction sets — deferred batches share an interchange). We parse it, echo
+# each set's BHT03, and emit a matching X12 271 wrapped in a CORE response
+# envelope. The 271 body below is the proven-good fixture from the billing repo
+# (engines/availity_soap/x12_271_test.clj `x12-271-sample`) — it parses through
+# parse-271 + assembly into a complete CoverageEligibilityResponse, so the mapper
+# does real CPU work. We only substitute element VALUES in place (BHT03, TRN,
+# NM1*IL, DMG, ST/SE control) — never add/remove segments — so SE01 stays valid.
+# --------------------------------------------------------------------------- #
+
+_PAYLOAD_RE = re.compile(r"<(?:\w+:)?Payload\b[^>]*>(.*?)</(?:\w+:)?Payload>", re.S)
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
+_WSSE_USER_RE = re.compile(r"<(?:\w+:)?Username>(.*?)</(?:\w+:)?Username>", re.S)
+_WSSE_PASS_RE = re.compile(r"<(?:\w+:)?Password\b[^>]*>(.*?)</(?:\w+:)?Password>", re.S)
+
+
+def _first(rx: re.Pattern, s: str) -> str | None:
+    m = rx.search(s or "")
+    return m.group(1).strip() if m else None
+
+# 271 envelope reused verbatim from the test fixture so it is guaranteed parseable
+# (fixed-width ISA, repetition separator '|'). Control numbers are constant — they
+# do not affect request<->response matching (that is BHT03 only) and need not be
+# unique for parse-271.
+_271_ISA = ("ISA*00*          *00*          *ZZ*6175910AAC21T  *ZZ*54503516A      "
+            "*061130*1445*|*00501*309242122*0*P*:")
+_271_GS = "GS*HB*617591011C21T*545035165*20030924*21000083*309001*X*005010X279A1"
+_271_IEA_CTRL = "309242122"
+_271_GS_CTRL = "309001"
+
+
+def _extract_270(soap_body: str) -> str | None:
+    """Pull the X12 270 string out of the CORE envelope's <Payload> (CDATA or
+    escaped). Returns None if no ISA-bearing payload is present."""
+    for payload in _PAYLOAD_RE.findall(soap_body):
+        m = _CDATA_RE.search(payload)
+        text = (m.group(1) if m else payload).strip()
+        if "ISA" in text:
+            return text
+    return None
+
+
+def _x12_delims(x12: str) -> tuple[str, str]:
+    """Detect (element_sep, segment_terminator) from the 270's ISA. element_sep is
+    the 4th char of ISA; the segment terminator is whatever ends ISA right before
+    the GS segment. Falls back to the common '*' / '~'."""
+    i = x12.find("ISA")
+    elem = x12[i + 3] if i != -1 and len(x12) > i + 3 else "*"
+    gs = x12.find("GS" + elem)
+    seg = x12[gs - 1] if gs > 0 else "~"
+    return elem, seg
+
+
+def _split_270_sets(x12: str) -> list[list[list[str]]]:
+    """Split a 270 interchange into transaction sets (ST..SE), each a list of
+    segments, each segment a list of elements."""
+    elem, seg = _x12_delims(x12)
+    segments = [s.strip() for s in x12.split(seg) if s.strip()]
+    sets, current = [], None
+    for raw in segments:
+        els = raw.split(elem)
+        tag = els[0]
+        if tag == "ST":
+            current = [els]
+        elif current is not None:
+            current.append(els)
+            if tag == "SE":
+                sets.append(current)
+                current = None
+    return sets
+
+
+def _subscriber_from_set(segments: list[list[str]]) -> dict:
+    """Extract BHT03 (required for matching) and subscriber NM1*IL / DMG (for
+    distinct-looking responses) from one 270 transaction set."""
+    out = {"bht03": None, "last": None, "first": None, "member": None, "dob": None}
+    for els in segments:
+        tag = els[0]
+        if tag == "BHT" and len(els) > 3:
+            out["bht03"] = els[3]
+        elif tag == "NM1" and len(els) > 1 and els[1] == "IL":
+            out["last"] = els[3] if len(els) > 3 and els[3] else None
+            out["first"] = els[4] if len(els) > 4 and els[4] else None
+            out["member"] = els[9] if len(els) > 9 and els[9] else None
+        elif tag == "DMG" and len(els) > 2:
+            out["dob"] = els[2] or None
+    return out
+
+
+def _build_271_set(sub: dict) -> list[str]:
+    """Build one 271 ST/SE transaction set (segment strings) echoing the inbound
+    set's BHT03 and subscriber. SE01 is computed from the real segment count."""
+    bht = sub["bht03"] or "".join(random.choice("0123456789") for _ in range(8))
+    last = sub["last"] or "LASTNAME"
+    first = sub["first"] or "FIRSTNAME"
+    member = sub["member"] or "11111"
+    dob = sub["dob"] or "19991231"
+    body = [
+        f"BHT*0022*11*{bht}*20030924*21000083",
+        "HL*1**20*1",
+        "NM1*PR*2*Texas Medicaid/Healthcare Services*****PI*617591011C21P",
+        "HL*2*1*21*1",
+        "NM1*1P*2*ORGANIZATION NAME*****SV*1111111111",
+        "HL*3*2*22*0",
+        f"TRN*2*{bht}*9999999999",
+        "TRN*1*XXXXXXXXEL.199912310000000*1111111111",
+        f"NM1*IL*1*{last}*{first}*M***MI*{member}",
+        "REF*SY*111111111",
+        "REF*F6*HICN123456",
+        "REF*1W*MR789012",
+        "N3*100 MAIN STREET",
+        "N4*TOWN*TX*12345",
+        f"DMG*D8*{dob}",
+        "DTP*346*D8*20141201",
+        "EB*1*IND*30|98|48|47|33|MH|1|UC|AL|86|50*MC*100 TRADITIONAL MEDICAID",
+        "REF*9F*GRP001",
+        "DTP*318*D8*20140918",
+        "DTP*356*D8*20140901",
+        "DTP*357*D8*20150430",
+        "EB*A**30|98|48|47|33|MH|1|UC|AL|86|50**100 TRADITIONAL MEDICAID***0",
+        "DTP*193*D8*20140901",
+        "DTP*194*D8*20150430",
+        "EB*B**30|98|48|47|33|MH|1|UC|AL|86|50**100 TRADITIONAL MEDICAID**0",
+        "DTP*193*D8*20140901",
+        "DTP*194*D8*20150430",
+        "EB*C**30**100 TRADITIONAL MEDICAID*23*0",
+        "DTP*193*D8*20140901",
+        "DTP*194*D8*20150430",
+        "EB*C**30**100 TRADITIONAL MEDICAID*29*0",
+        "DTP*356*D8*20090101",
+        "DTP*357*D8*20090202",
+        "EB*I*IND*35|88*MC*100 TRADITIONAL MEDICAID",
+        "DTP*193*D8*20140901",
+        "DTP*194*D8*20150430",
+        "EB*1*IND*30|98|48|47|33|MH|1|UC|AL|86|50*OT*A1HEALTHPLAN NAME",
+        "DTP*318*D8*20141007",
+        "DTP*356*D8*20141001",
+        "DTP*357*D8*20150430",
+        "LS*2120",
+        "NM1*1P*2*HEALTH PLAN INC*****PI*9876543210",
+        "PER*IC**TE*2125551234*FX*2125555678",
+        "N3*500 PARK AVE",
+        "N4*NEW YORK*NY*10001",
+        "LE*2120",
+    ]
+    segs = [f"ST*271*{bht}*005010X279A1"] + body
+    segs.append(f"SE*{len(segs) + 1}*{bht}")
+    return segs
+
+
+def _build_271_rejection_set(sub: dict) -> list[str]:
+    """Build a 271 set carrying a subscriber-level AAA*N* rejection (engine ->
+    x12-response-rejected -> per-request validation error). BHT03 still echoed."""
+    bht = sub["bht03"] or "".join(random.choice("0123456789") for _ in range(8))
+    last = sub["last"] or "DOE"
+    first = sub["first"] or "JANE"
+    member = sub["member"] or "W1"
+    dob = sub["dob"] or "19900101"
+    segs = [
+        f"ST*271*{bht}*005010X279A1",
+        f"BHT*0022*11*{bht}*20260325*1113",
+        "HL*1**20*1",
+        "NM1*PR*2*TEXAS MEDICAID*****46*10186",
+        "HL*2*1*21*1",
+        "NM1*1P*2*PROVIDER*****XX*1234567890",
+        "HL*3*2*22*0",
+        f"NM1*IL*1*{last}*{first}****MI*{member}",
+        f"DMG*D8*{dob}*F",
+        "AAA*N**79*C",
+    ]
+    segs.append(f"SE*{len(segs) + 1}*{bht}")
+    return segs
+
+
+def _build_271_interchange(set_segment_lists: list[list[str]]) -> str:
+    """Wrap N transaction sets in the fixture ISA/GS .. GE/IEA envelope."""
+    lines = [_271_ISA, _271_GS]
+    for segs in set_segment_lists:
+        lines.extend(segs)
+    lines.append(f"GE*{len(set_segment_lists)}*{_271_GS_CTRL}")
+    lines.append(f"IEA*1*{_271_IEA_CTRL}")
+    return "~".join(lines) + "~"
+
+
+def _soap_271_envelope(x12_271: str) -> str:
+    payload_id = str(random.randrange(10 ** 18))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">'
+        "<soapenv:Body>"
+        '<ns1:COREEnvelopeRealTimeResponse '
+        'xmlns:ns1="http://www.caqh.org/SOAP/WSDL/CORERule2.0.1.xsd">'
+        "<PayloadType>X12_271_Response_005010X279A1</PayloadType>"
+        "<ProcessingMode>RealTime</ProcessingMode>"
+        f"<PayloadID>{payload_id}</PayloadID>"
+        f"<Payload><![CDATA[{x12_271}]]></Payload>"
+        "</ns1:COREEnvelopeRealTimeResponse>"
+        "</soapenv:Body></soapenv:Envelope>"
+    )
+
+
+def _soap_fault_envelope(reason: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">'
+        "<soapenv:Body><soapenv:Fault>"
+        "<faultcode>soapenv:Server</faultcode>"
+        f"<faultstring>{reason}</faultstring>"
+        "</soapenv:Fault></soapenv:Body></soapenv:Envelope>"
+    )
+
+
+def _build_271_for_270(x12_270: str) -> tuple[str, int, int]:
+    """Turn an inbound 270 into a 271 interchange string. Returns
+    (x12_271, set_count, rejected_count)."""
+    sets = _split_270_sets(x12_270)
+    rejected = 0
+    out_sets = []
+    for s in sets:
+        sub = _subscriber_from_set(s)
+        if _roll(_ERROR_PCT):
+            out_sets.append(_build_271_rejection_set(sub))
+            rejected += 1
+        else:
+            out_sets.append(_build_271_set(sub))
+    return _build_271_interchange(out_sets), len(out_sets), rejected
+
+
 class _Handler(BaseHTTPRequestHandler):
     # ----- response helpers -------------------------------------------------
     def _json(self, code: int, obj) -> None:
@@ -303,11 +556,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _read_form(self) -> dict:
+    def _xml(self, code: int, body: str) -> None:
+        payload = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _read_raw(self) -> str:
         length = int(self.headers.get("Content-Length", 0) or 0)
-        raw = self.rfile.read(length).decode() if length else ""
+        return self.rfile.read(length).decode("utf-8", "replace") if length else ""
+
+    def _read_form(self) -> dict:
         # Engine sends application/x-www-form-urlencoded for both /token and /coverages.
-        return {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+        return {k: v[-1] for k, v in parse_qs(self._read_raw(), keep_blank_values=True).items()}
 
     def _bump(self, key: str) -> None:
         with _lock:
@@ -331,7 +594,15 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/coverages":
             self._post_coverages()
         else:
-            self._json(404, {"errors": [{"field": "path", "errorMessage": "not found"}]})
+            # availity-soap posts the CORE envelope to base-url root (no path
+            # appended). Route anything XML/SOAP-shaped here regardless of path.
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            body = self._read_raw()
+            if "xml" in ctype or "soap" in ctype or body.lstrip().startswith("<"):
+                self._soap(body)
+            else:
+                self._json(404, {"errors": [{"field": "path",
+                                             "errorMessage": "not found"}]})
 
     # ----- endpoints --------------------------------------------------------
     def _token(self):
@@ -383,6 +654,28 @@ class _Handler(BaseHTTPRequestHandler):
         body["id"] = coverage_id
         return body
 
+    def _soap(self, body: str):
+        """availity-soap: parse the 270 from the CORE envelope, emit a matching
+        271 (one set per inbound set, BHT03 echoed). One round trip — no poll."""
+        self._bump("soap_request")
+        if (_SOAP_USERNAME and _first(_WSSE_USER_RE, body) != _SOAP_USERNAME) or (
+            _SOAP_PASSWORD and _first(_WSSE_PASS_RE, body) != _SOAP_PASSWORD
+        ):
+            self._bump("unauthorized")
+            self._xml(500, _soap_fault_envelope("WSSE authentication failed"))
+            return
+        x12_270 = _extract_270(body)
+        if not x12_270:
+            self._bump("soap_fault")
+            self._xml(500, _soap_fault_envelope("No X12 270 payload found"))
+            return
+        _sleep_latency()
+        x12_271, set_count, rejected = _build_271_for_270(x12_270)
+        with _lock:
+            _counts["soap_sets"] += set_count
+            _counts["soap_rejected"] += rejected
+        self._xml(200, _soap_271_envelope(x12_271))
+
     def _stats(self):
         with _lock:
             stats = {
@@ -392,6 +685,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "pending_returned": _counts["pending"],
                 "errors_returned": _counts["error"],
                 "unauthorized": _counts["unauthorized"],
+                "soap_requests": _counts["soap_request"],
+                "soap_transaction_sets": _counts["soap_sets"],
+                "soap_rejected": _counts["soap_rejected"],
+                "soap_faults": _counts["soap_fault"],
             }
             if _TRACK_MEMBERS:
                 dupes = {m: c for m, c in _member_submits.items() if c > 1}
@@ -410,6 +707,7 @@ def main():
     print(f"[availity-mock] latency={_LATENCY_MS}±{_LATENCY_JITTER_MS}ms "
           f"pending={_PENDING_PCT}% error={_ERROR_PCT}% "
           f"track_members={_TRACK_MEMBERS}")
+    print(f"[availity-mock] engines: REST (/token,/coverages) + SOAP (X12 270->271 at /)")
     print(f"[availity-mock] point the payer ExchangeProfile credentials.base-url here")
     print(f"[availity-mock] stats at http://{_HOST}:{_PORT}/stats")
     try:
